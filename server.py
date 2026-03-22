@@ -45,6 +45,10 @@ def sessions_dir() -> Path:
     return storage() / "sessions"
 
 
+def projects_dir() -> Path:
+    return storage() / "projects"
+
+
 def index_path() -> Path:
     return storage() / "index.json"
 
@@ -54,7 +58,7 @@ def reviewers_path() -> Path:
 
 
 def ensure_dirs():
-    for d in [papers_dir(), synthesis_dir(), ideas_dir(), sessions_dir()]:
+    for d in [papers_dir(), synthesis_dir(), ideas_dir(), sessions_dir(), projects_dir()]:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -66,7 +70,7 @@ def load_index() -> dict:
     p = index_path()
     if p.exists():
         return json.loads(p.read_text())
-    return {"papers": {}, "synthesis": {}, "ideas": {}, "sessions": {}}
+    return {"papers": {}, "synthesis": {}, "ideas": {}, "sessions": {}, "projects": {}}
 
 
 def save_index(idx: dict):
@@ -107,6 +111,10 @@ def make_exp_id(name: str) -> str:
     return f"exp-{ts()}-{slugify(name)}"
 
 
+def make_project_id(name: str) -> str:
+    return f"proj-{ts()}-{slugify(name)}"
+
+
 def make_synth_id(name: str) -> str:
     return f"synth-{ts()}-{slugify(name)}"
 
@@ -139,6 +147,13 @@ def _get_manifest(node_id: str, idx: dict) -> Optional[dict]:
     if node_id in idx.get("synthesis", {}):
         p = synthesis_dir() / node_id / "manifest.json"
         return json.loads(p.read_text()) if p.exists() else None
+    if node_id in idx.get("projects", {}):
+        p = projects_dir() / node_id / "manifest.json"
+        return json.loads(p.read_text()) if p.exists() else None
+    for project_id in idx.get("projects", {}):
+        p = projects_dir() / project_id / "experiments" / node_id / "manifest.json"
+        if p.exists():
+            return json.loads(p.read_text())
     return None
 
 
@@ -158,9 +173,11 @@ def compute_generation(node_id: str, idx: dict, _visited: set = None) -> int:
     return 1 + max(compute_generation(p, idx, _visited) for p in parents)
 
 
-def _load_reviews_for(exp_id: str, paper_id: Optional[str]) -> list:
+def _load_reviews_for(exp_id: str, paper_id: Optional[str] = None, project_id: Optional[str] = None) -> list:
     if paper_id:
         d = papers_dir() / paper_id / "experiments" / exp_id / "reviews"
+    elif project_id:
+        d = projects_dir() / project_id / "experiments" / exp_id / "reviews"
     else:
         d = synthesis_dir() / exp_id / "reviews"
     if not d.exists():
@@ -168,9 +185,9 @@ def _load_reviews_for(exp_id: str, paper_id: Optional[str]) -> list:
     return [json.loads(f.read_text()) for f in d.glob("*.json")]
 
 
-def compute_confidence(exp_id: str, paper_id: Optional[str] = None) -> float:
+def compute_confidence(exp_id: str, paper_id: Optional[str] = None, project_id: Optional[str] = None) -> float:
     """Review-weighted confidence score. Unreviewed = 1.0 (benefit of the doubt)."""
-    reviews = _load_reviews_for(exp_id, paper_id)
+    reviews = _load_reviews_for(exp_id, paper_id, project_id)
     if not reviews:
         return 1.0
     reviewers = load_reviewers()
@@ -502,7 +519,8 @@ def checkin(
         if exp["id"] == experiment_id:
             exp.update({"status": "complete", "outcome_direction": outcome_direction, "one_line": one_line})
     save_index(idx)
-
+    snapshot(f"checkin {experiment_id}: {outcome_direction} — {one_line}",
+             session_id=manifest.get("session_id"))
     return {"status": "checked_in", "experiment_id": experiment_id, "outcome": outcome_direction}
 
 
@@ -520,8 +538,26 @@ def browse_stacks() -> list[dict]:
             st = json.loads(st_path.read_text())
             if st.get("status") == "checked_out":
                 out.append({
-                    "paper_id": paper_id,
-                    "paper_title": paper_data.get("title"),
+                    "root_type": "paper",
+                    "root_id": paper_id,
+                    "root_label": paper_data.get("title"),
+                    "experiment_id": exp["id"],
+                    "name": exp.get("name"),
+                    "checked_out_by": st.get("checked_out_by"),
+                    "intent": st.get("intent"),
+                    "checked_out_at": st.get("checked_out_at"),
+                })
+    for project_id, project_data in idx.get("projects", {}).items():
+        for exp in project_data.get("experiments", []):
+            st_path = projects_dir() / project_id / "experiments" / exp["id"] / "status.json"
+            if not st_path.exists():
+                continue
+            st = json.loads(st_path.read_text())
+            if st.get("status") == "checked_out":
+                out.append({
+                    "root_type": "project",
+                    "root_id": project_id,
+                    "root_label": project_data.get("name"),
                     "experiment_id": exp["id"],
                     "name": exp.get("name"),
                     "checked_out_by": st.get("checked_out_by"),
@@ -544,14 +580,32 @@ def browse_shelf(concept: str = None, status: str = "complete") -> list[dict]:
             if concept and concept.lower() not in [c.lower() for c in exp.get("concepts", [])]:
                 continue
             out.append({
-                "paper_id": paper_id,
-                "paper_title": paper_data.get("title"),
+                "root_type": "paper",
+                "root_id": paper_id,
+                "root_label": paper_data.get("title"),
                 "experiment_id": exp["id"],
                 "name": exp.get("name"),
                 "concepts": exp.get("concepts", []),
                 "outcome_direction": exp.get("outcome_direction"),
                 "one_line": exp.get("one_line"),
                 "confidence": compute_confidence(exp["id"], paper_id),
+            })
+    for project_id, project_data in idx.get("projects", {}).items():
+        for exp in project_data.get("experiments", []):
+            if status and exp.get("status") != status:
+                continue
+            if concept and concept.lower() not in [c.lower() for c in exp.get("concepts", [])]:
+                continue
+            out.append({
+                "root_type": "project",
+                "root_id": project_id,
+                "root_label": project_data.get("name"),
+                "experiment_id": exp["id"],
+                "name": exp.get("name"),
+                "concepts": exp.get("concepts", []),
+                "outcome_direction": exp.get("outcome_direction"),
+                "one_line": exp.get("one_line"),
+                "confidence": compute_confidence(exp["id"], project_id=project_id),
             })
     return out
 
@@ -701,6 +755,8 @@ def checkin_synthesis(
             "one_line": one_line,
         })
     save_index(idx)
+    snapshot(f"checkin synthesis {synthesis_id}: {outcome_direction} — {one_line}",
+             session_id=manifest.get("session_id"))
     return {"status": "checked_in", "synthesis_id": synthesis_id}
 
 
@@ -786,6 +842,223 @@ def promote_idea(idea_id: str, experiment_id: str) -> dict:
         idx["ideas"][idea_id]["status"] = "absorbed"
     save_index(idx)
     return {"status": "ok"}
+
+
+# ──────────────────────────────────────────────────────────────
+# TOOLS: Projects (paper-free experiment roots)
+# ──────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def create_project(
+    name: str,
+    description: str,
+    seeded_from: list[str] = None,
+    concepts: list[str] = None,
+) -> dict:
+    """
+    Create a project as a first-class experiment root — no paper required.
+
+    Use this when work has organically moved past any single paper, when you're
+    running pure empirical exploration, or when the starting point is an idea
+    rather than a paper. Projects are full graph nodes; experiments under them
+    participate in lineage, synthesis, contradiction detection, and all discovery
+    tools exactly like paper experiments.
+
+    seeded_from: optional list of paper arxiv_ids or other project_ids that
+                 inspired this project. Recorded as lineage but not required.
+                 Empty seeded_from is valid — pure exploration is a legitimate root.
+    """
+    ensure_dirs()
+    project_id = make_project_id(name)
+    proj_path = projects_dir() / project_id
+    proj_path.mkdir(parents=True, exist_ok=True)
+    (proj_path / "experiments").mkdir(exist_ok=True)
+
+    manifest = {
+        "id": project_id,
+        "name": name,
+        "description": description,
+        "seeded_from": seeded_from or [],
+        "concepts": concepts or [],
+        "created_at": now_iso(),
+        "derived_from": seeded_from or [],
+    }
+    (proj_path / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (proj_path / "notes.md").write_text(f"# {name}\n\n{description}\n\n---\n\n")
+
+    idx = load_index()
+    idx.setdefault("projects", {})[project_id] = {
+        "name": name,
+        "description": description[:120],
+        "seeded_from": seeded_from or [],
+        "concepts": concepts or [],
+        "created_at": manifest["created_at"],
+        "experiments": [],
+    }
+    save_index(idx)
+    return {"project_id": project_id, "path": str(proj_path)}
+
+
+@mcp.tool()
+def list_projects() -> list[dict]:
+    """List all projects with experiment counts and seeded_from lineage."""
+    ensure_dirs()
+    idx = load_index()
+    return [
+        {
+            "project_id": pid,
+            "name": p.get("name"),
+            "description": p.get("description"),
+            "seeded_from": p.get("seeded_from", []),
+            "concepts": p.get("concepts", []),
+            "experiment_count": len(p.get("experiments", [])),
+            "created_at": p.get("created_at"),
+        }
+        for pid, p in idx.get("projects", {}).items()
+    ]
+
+
+@mcp.tool()
+def annotate_project(project_id: str, note: str) -> dict:
+    """Append a timestamped note to a project's running log."""
+    p = projects_dir() / project_id / "notes.md"
+    if not p.exists():
+        return {"error": f"Project {project_id} not found."}
+    p.write_text(p.read_text() + f"\n---\n*{now_iso()}*\n\n{note}\n")
+    return {"status": "ok"}
+
+
+@mcp.tool()
+def checkout_project_experiment(
+    project_id: str,
+    experiment_name: str,
+    agent_id: str,
+    intent: str,
+    derived_from: list[str] = None,
+    concepts: list[str] = None,
+    hyperparameter_axes: list[str] = None,
+    session_id: str = None,
+) -> dict:
+    """
+    Check out a new experiment under a project (not a paper).
+
+    Identical to checkout() in every way — same documentation requirements,
+    same hypothesis-first discipline, same checkin enforcement.
+    derived_from can point to paper experiments, other project experiments,
+    synthesis nodes, or anything else in the graph.
+    """
+    ensure_dirs()
+    idx = load_index()
+    if project_id not in idx.get("projects", {}):
+        return {"error": f"Project {project_id} not found. Run create_project first."}
+
+    exp_id = make_exp_id(experiment_name)
+    exp_path = projects_dir() / project_id / "experiments" / exp_id
+    exp_path.mkdir(parents=True, exist_ok=True)
+    (exp_path / "outcomes").mkdir(exist_ok=True)
+    (exp_path / "reviews").mkdir(exist_ok=True)
+
+    for fname, content in EXPERIMENT_TEMPLATES.items():
+        (exp_path / fname).write_text(content)
+    for fname, content in OUTCOMES_TEMPLATES.items():
+        (exp_path / "outcomes" / fname).write_text(content)
+
+    manifest = {
+        "id": exp_id,
+        "name": experiment_name,
+        "project_id": project_id,
+        "derived_from": derived_from or [],
+        "concepts": concepts or [],
+        "hyperparameter_axes": hyperparameter_axes or [],
+        "session_id": session_id,
+        "created_at": now_iso(),
+    }
+    (exp_path / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (exp_path / "status.json").write_text(json.dumps({
+        "status": "checked_out",
+        "checked_out_by": agent_id,
+        "intent": intent,
+        "checked_out_at": now_iso(),
+        "locked": False,
+    }, indent=2))
+
+    idx["projects"][project_id].setdefault("experiments", []).append({
+        "id": exp_id,
+        "name": experiment_name,
+        "status": "checked_out",
+        "concepts": concepts or [],
+    })
+    save_index(idx)
+    return {
+        "experiment_id": exp_id,
+        "path": str(exp_path),
+        "next_step": "Fill hypothesis.md BEFORE running anything.",
+        "required_files": list(REQUIRED_SECTIONS.keys()),
+    }
+
+
+@mcp.tool()
+def checkin_project_experiment(
+    project_id: str,
+    experiment_id: str,
+    agent_id: str,
+    outcome_direction: Literal["positive", "negative", "inconclusive", "derailed"],
+    one_line: str,
+    derailment_type: Optional[Literal["implementation_error", "bad_hypothesis", "data_issue", "scope_creep"]] = None,
+    surprising: bool = False,
+) -> dict:
+    """Check in a completed project experiment. Same rules as checkin()."""
+    exp_path = projects_dir() / project_id / "experiments" / experiment_id
+    if not exp_path.exists():
+        return {"error": "Experiment not found"}
+
+    status_data = json.loads((exp_path / "status.json").read_text())
+    if status_data.get("status") == "complete":
+        return {"error": "Already checked in. Experiments are immutable after checkin."}
+    if status_data.get("checked_out_by") != agent_id:
+        return {"error": f"Checked out by {status_data.get('checked_out_by')}, not {agent_id}."}
+    if outcome_direction == "derailed" and not derailment_type:
+        return {"error": "derailment_type is required when outcome_direction is 'derailed'."}
+
+    errors = _validate_docs(exp_path)
+    if errors:
+        return {"error": "Documentation incomplete — cannot check in.", "issues": errors}
+
+    status_data.update({
+        "status": "complete",
+        "checked_in_at": now_iso(),
+        "outcome_direction": outcome_direction,
+        "derailment_type": derailment_type,
+        "surprising": surprising,
+        "locked": True,
+    })
+    (exp_path / "status.json").write_text(json.dumps(status_data, indent=2))
+
+    manifest = json.loads((exp_path / "manifest.json").read_text())
+    manifest.update({"outcome_direction": outcome_direction, "surprising": surprising, "one_line": one_line})
+    (exp_path / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    idx = load_index()
+    for exp in idx["projects"][project_id].get("experiments", []):
+        if exp["id"] == experiment_id:
+            exp.update({"status": "complete", "outcome_direction": outcome_direction, "one_line": one_line})
+    save_index(idx)
+    snapshot(f"checkin {experiment_id}: {outcome_direction} — {one_line}",
+             session_id=manifest.get("session_id"))
+    return {"status": "checked_in", "experiment_id": experiment_id, "outcome": outcome_direction}
+
+
+@mcp.tool()
+def list_project_experiments(project_id: str) -> list[dict]:
+    """List all experiments under a project with status and confidence."""
+    idx = load_index()
+    project = idx.get("projects", {}).get(project_id)
+    if not project:
+        return []
+    return [
+        {**exp, "confidence": compute_confidence(exp["id"], project_id=project_id)}
+        for exp in project.get("experiments", [])
+    ]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1003,27 +1276,39 @@ def list_unreviewed(min_age_hours: int = 0) -> list[dict]:
     idx = load_index()
     now = datetime.now(timezone.utc)
     out = []
+
+    def _check(exp, root_type, root_id, st_base_path):
+        if exp.get("status") != "complete":
+            return
+        if _load_reviews_for(exp["id"],
+                              paper_id=root_id if root_type == "paper" else None,
+                              project_id=root_id if root_type == "project" else None):
+            return
+        st_path = st_base_path / exp["id"] / "status.json"
+        if st_path.exists() and min_age_hours > 0:
+            st = json.loads(st_path.read_text())
+            checked_in = st.get("checked_in_at")
+            if checked_in:
+                age_h = (now - datetime.fromisoformat(checked_in)).total_seconds() / 3600
+                if age_h < min_age_hours:
+                    return
+        out.append({
+            "root_type": root_type,
+            "root_id": root_id,
+            "experiment_id": exp["id"],
+            "name": exp.get("name"),
+            "outcome_direction": exp.get("outcome_direction"),
+            "concepts": exp.get("concepts", []),
+        })
+
     for paper_id, paper_data in idx.get("papers", {}).items():
+        base = papers_dir() / paper_id / "experiments"
         for exp in paper_data.get("experiments", []):
-            if exp.get("status") != "complete":
-                continue
-            if _load_reviews_for(exp["id"], paper_id):
-                continue
-            st_path = papers_dir() / paper_id / "experiments" / exp["id"] / "status.json"
-            if st_path.exists() and min_age_hours > 0:
-                st = json.loads(st_path.read_text())
-                checked_in = st.get("checked_in_at")
-                if checked_in:
-                    age_h = (now - datetime.fromisoformat(checked_in)).total_seconds() / 3600
-                    if age_h < min_age_hours:
-                        continue
-            out.append({
-                "paper_id": paper_id,
-                "experiment_id": exp["id"],
-                "name": exp.get("name"),
-                "outcome_direction": exp.get("outcome_direction"),
-                "concepts": exp.get("concepts", []),
-            })
+            _check(exp, "paper", paper_id, base)
+    for project_id, project_data in idx.get("projects", {}).items():
+        base = projects_dir() / project_id / "experiments"
+        for exp in project_data.get("experiments", []):
+            _check(exp, "project", project_id, base)
     return out
 
 
@@ -1054,6 +1339,7 @@ def suggest_synthesis(
 
     seed_concepts: set = set()
     seed_paper_ids: set = set()
+    seed_project_ids: set = set()
     seed_generations: set = set()
     for seed_id in seed_ids:
         for paper_id, paper_data in idx.get("papers", {}).items():
@@ -1062,52 +1348,64 @@ def suggest_synthesis(
                     seed_concepts.update(exp.get("concepts", []))
                     seed_paper_ids.add(paper_id)
                     seed_generations.add(compute_generation(seed_id, idx))
+        for project_id, project_data in idx.get("projects", {}).items():
+            for exp in project_data.get("experiments", []):
+                if exp["id"] == seed_id:
+                    seed_concepts.update(exp.get("concepts", []))
+                    seed_project_ids.add(project_id)
+                    seed_generations.add(compute_generation(seed_id, idx))
 
     candidates = []
+
+    def _eval_candidate(exp, root_id, root_type):
+        if exp["id"] in seed_ids or exp.get("status") != "complete":
+            return
+        conf = compute_confidence(exp["id"],
+                                  paper_id=root_id if root_type == "paper" else None,
+                                  project_id=root_id if root_type == "project" else None)
+        if conf < min_confidence:
+            return
+        overlap = seed_concepts & set(exp.get("concepts", []))
+        if not overlap:
+            return
+        is_sibling = (root_id in seed_paper_ids) or (root_id in seed_project_ids)
+        gen = compute_generation(exp["id"], idx)
+        is_cross_gen = gen not in seed_generations
+        if strategy == "sibling" and not is_sibling:
+            return
+        if strategy == "cross_paper" and is_sibling:
+            return
+        if strategy == "cross_gen" and not is_cross_gen:
+            return
+        rationale_parts = [f"Shares concepts: {', '.join(overlap)}."]
+        if is_sibling:
+            rationale_parts.append(f"Same-{root_type} sibling.")
+        else:
+            rationale_parts.append(f"Cross-{root_type} lineage.")
+        if is_cross_gen:
+            rationale_parts.append(f"Different generation (gen {gen}).")
+        if exp.get("surprising"):
+            rationale_parts.append("Marked surprising — high synthesis value.")
+        candidates.append({
+            "root_type": root_type,
+            "root_id": root_id,
+            "experiment_id": exp["id"],
+            "name": exp.get("name"),
+            "concepts": exp.get("concepts", []),
+            "shared_concepts": list(overlap),
+            "outcome_direction": exp.get("outcome_direction"),
+            "generation": gen,
+            "confidence": conf,
+            "rationale": " ".join(rationale_parts),
+            "score": len(overlap) * conf + (0.3 if exp.get("surprising") else 0),
+        })
+
     for paper_id, paper_data in idx.get("papers", {}).items():
         for exp in paper_data.get("experiments", []):
-            if exp["id"] in seed_ids or exp.get("status") != "complete":
-                continue
-            conf = compute_confidence(exp["id"], paper_id)
-            if conf < min_confidence:
-                continue
-            overlap = seed_concepts & set(exp.get("concepts", []))
-            if not overlap:
-                continue
-
-            is_sibling = paper_id in seed_paper_ids
-            gen = compute_generation(exp["id"], idx)
-            is_cross_gen = gen not in seed_generations
-
-            if strategy == "sibling" and not is_sibling:
-                continue
-            if strategy == "cross_paper" and is_sibling:
-                continue
-            if strategy == "cross_gen" and not is_cross_gen:
-                continue
-
-            rationale_parts = [f"Shares concepts: {', '.join(overlap)}."]
-            if is_sibling:
-                rationale_parts.append("Same-paper sibling.")
-            else:
-                rationale_parts.append("Cross-paper lineage.")
-            if is_cross_gen:
-                rationale_parts.append(f"Different generation (gen {gen}).")
-            if exp.get("surprising"):
-                rationale_parts.append("Marked surprising — high synthesis value.")
-
-            candidates.append({
-                "paper_id": paper_id,
-                "experiment_id": exp["id"],
-                "name": exp.get("name"),
-                "concepts": exp.get("concepts", []),
-                "shared_concepts": list(overlap),
-                "outcome_direction": exp.get("outcome_direction"),
-                "generation": gen,
-                "confidence": conf,
-                "rationale": " ".join(rationale_parts),
-                "score": len(overlap) * conf + (0.3 if exp.get("surprising") else 0),
-            })
+            _eval_candidate(exp, paper_id, "paper")
+    for project_id, project_data in idx.get("projects", {}).items():
+        for exp in project_data.get("experiments", []):
+            _eval_candidate(exp, project_id, "project")
 
     return sorted(candidates, key=lambda x: x["score"], reverse=True)[:10]
 
@@ -1121,9 +1419,14 @@ def find_contradictions() -> list[dict]:
     ensure_dirs()
     idx = load_index()
     all_exps = [
-        {**exp, "paper_id": paper_id}
+        {**exp, "root_type": "paper", "root_id": paper_id}
         for paper_id, paper_data in idx.get("papers", {}).items()
         for exp in paper_data.get("experiments", [])
+        if exp.get("status") == "complete"
+    ] + [
+        {**exp, "root_type": "project", "root_id": project_id}
+        for project_id, project_data in idx.get("projects", {}).items()
+        for exp in project_data.get("experiments", [])
         if exp.get("status") == "complete"
     ]
     out = []
@@ -1134,10 +1437,10 @@ def find_contradictions() -> list[dict]:
                 continue
             if {a.get("outcome_direction"), b.get("outcome_direction")} == {"positive", "negative"}:
                 out.append({
-                    "experiment_a": {"id": a["id"], "paper_id": a["paper_id"], "name": a.get("name"),
-                                     "outcome": a.get("outcome_direction")},
-                    "experiment_b": {"id": b["id"], "paper_id": b["paper_id"], "name": b.get("name"),
-                                     "outcome": b.get("outcome_direction")},
+                    "experiment_a": {"id": a["id"], "root_type": a["root_type"], "root_id": a["root_id"],
+                                     "name": a.get("name"), "outcome": a.get("outcome_direction")},
+                    "experiment_b": {"id": b["id"], "root_type": b["root_type"], "root_id": b["root_id"],
+                                     "name": b.get("name"), "outcome": b.get("outcome_direction")},
                     "shared_concepts": list(shared),
                     "note": "Opposite outcomes on shared concepts — strong synthesis candidate",
                 })
@@ -1166,11 +1469,25 @@ def find_derailments(derailment_type: str = None) -> list[dict]:
             if derailment_type and dt != derailment_type:
                 continue
             out.append({
-                "paper_id": paper_id,
-                "experiment_id": exp["id"],
-                "name": exp.get("name"),
-                "derailment_type": dt,
-                "concepts": exp.get("concepts", []),
+                "root_type": "paper", "root_id": paper_id,
+                "experiment_id": exp["id"], "name": exp.get("name"),
+                "derailment_type": dt, "concepts": exp.get("concepts", []),
+            })
+    for project_id, project_data in idx.get("projects", {}).items():
+        for exp in project_data.get("experiments", []):
+            if exp.get("outcome_direction") != "derailed":
+                continue
+            st_path = projects_dir() / project_id / "experiments" / exp["id"] / "status.json"
+            if not st_path.exists():
+                continue
+            st = json.loads(st_path.read_text())
+            dt = st.get("derailment_type")
+            if derailment_type and dt != derailment_type:
+                continue
+            out.append({
+                "root_type": "project", "root_id": project_id,
+                "experiment_id": exp["id"], "name": exp.get("name"),
+                "derailment_type": dt, "concepts": exp.get("concepts", []),
             })
     return out
 
@@ -1180,17 +1497,24 @@ def find_underexplored(max_experiments: int = 2) -> list[dict]:
     """Papers with few experiments relative to their size — candidates for more work."""
     ensure_dirs()
     idx = load_index()
-    return sorted([
-        {
-            "arxiv_id": pid,
-            "title": p.get("title"),
-            "experiment_count": len(p.get("experiments", [])),
-            "categories": p.get("categories", []),
-            "published": p.get("published"),
-        }
-        for pid, p in idx.get("papers", {}).items()
-        if len(p.get("experiments", [])) <= max_experiments
-    ], key=lambda x: x["experiment_count"])
+    results = []
+    for pid, p in idx.get("papers", {}).items():
+        if len(p.get("experiments", [])) <= max_experiments:
+            results.append({
+                "root_type": "paper", "root_id": pid,
+                "label": p.get("title"),
+                "experiment_count": len(p.get("experiments", [])),
+                "categories": p.get("categories", []),
+            })
+    for pid, p in idx.get("projects", {}).items():
+        if len(p.get("experiments", [])) <= max_experiments:
+            results.append({
+                "root_type": "project", "root_id": pid,
+                "label": p.get("name"),
+                "experiment_count": len(p.get("experiments", [])),
+                "description": p.get("description", ""),
+            })
+    return sorted(results, key=lambda x: x["experiment_count"])
 
 
 @mcp.tool()
@@ -1477,6 +1801,220 @@ sim.on("tick", () => {{
     Path(output_path).write_text(html)
     return {"status": "exported", "path": output_path,
             "note": "Open in any browser. Drag nodes, scroll to zoom."}
+
+
+# ──────────────────────────────────────────────────────────────
+# TOOLS: Git
+# ──────────────────────────────────────────────────────────────
+
+import subprocess
+
+
+def _git(args: list[str], cwd: Path = None) -> tuple[int, str, str]:
+    """Run a git command. Returns (returncode, stdout, stderr)."""
+    cwd = cwd or storage()
+    r = subprocess.run(["git"] + args, cwd=str(cwd), capture_output=True, text=True)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def _git_ok(args: list[str], cwd: Path = None) -> dict:
+    code, out, err = _git(args, cwd)
+    if code != 0:
+        return {"error": err or out}
+    return {"ok": True, "output": out}
+
+
+@mcp.tool()
+def init_repo(remote_url: str = None) -> dict:
+    """
+    Initialize the storage directory as a git repository.
+    Writes a sensible .gitignore and makes an initial commit.
+    Optionally adds a remote and pushes.
+
+    Run once when setting up a new storage path.
+    """
+    ensure_dirs()
+    root = storage()
+
+    code, _, _ = _git(["rev-parse", "--git-dir"])
+    if code == 0:
+        return {"error": "Already a git repository. Nothing to do."}
+
+    gitignore = root / ".gitignore"
+    gitignore.write_text("__pycache__/\n*.pyc\n*.pyo\n.DS_Store\ngraph.html\n")
+
+    for step in [
+        ["init"],
+        ["add", "."],
+        ["commit", "-m", "init stacks"],
+    ]:
+        result = _git_ok(step)
+        if "error" in result:
+            return result
+
+    if remote_url:
+        for step in [
+            ["remote", "add", "origin", remote_url],
+            ["push", "-u", "origin", "main"],
+        ]:
+            result = _git_ok(step)
+            if "error" in result:
+                return result
+        return {"ok": True, "remote": remote_url}
+
+    return {"ok": True, "note": "Repo initialized locally. Add a remote with git remote add origin <url> when ready."}
+
+
+@mcp.tool()
+def snapshot(message: str, session_id: str = None) -> dict:
+    """
+    Commit all current changes to the store.
+
+    Called automatically on checkin and checkin_synthesis.
+    Can also be called manually at any point — e.g. after annotating
+    a paper or recording ideas.
+
+    If the storage directory is not a git repo, returns an error without
+    touching anything.
+    """
+    code, _, _ = _git(["rev-parse", "--git-dir"])
+    if code != 0:
+        return {"error": "Storage directory is not a git repository. Run init_repo first."}
+
+    code, out, _ = _git(["status", "--porcelain"])
+    if code == 0 and not out:
+        return {"ok": True, "note": "Nothing to commit."}
+
+    full_msg = f"{message} [{session_id}]" if session_id else message
+    for step in [["add", "-A"], ["commit", "-m", full_msg]]:
+        result = _git_ok(step)
+        if "error" in result:
+            return result
+
+    _, sha, _ = _git(["rev-parse", "--short", "HEAD"])
+    return {"ok": True, "commit": sha, "message": full_msg}
+
+
+@mcp.tool()
+def push(remote: str = "origin", branch: str = "main") -> dict:
+    """Push committed changes to the remote. Run after closing a session."""
+    return _git_ok(["push", remote, branch])
+
+
+@mcp.tool()
+def branch_session(session_id: str) -> dict:
+    """
+    Create and switch to a branch named after a session ID.
+    Enables per-agent branch isolation — merge or PR when the session closes.
+    """
+    code, _, _ = _git(["rev-parse", "--git-dir"])
+    if code != 0:
+        return {"error": "Not a git repository."}
+    result = _git_ok(["checkout", "-b", session_id])
+    if "error" in result:
+        return result
+    return {"ok": True, "branch": session_id}
+
+
+@mcp.tool()
+def merge_session(session_id: str, delete_branch: bool = True) -> dict:
+    """
+    Merge a session branch back into main and optionally delete it.
+    Call after close_session when working with branch-per-agent isolation.
+    """
+    code, _, _ = _git(["rev-parse", "--git-dir"])
+    if code != 0:
+        return {"error": "Not a git repository."}
+
+    for step in [
+        ["checkout", "main"],
+        ["merge", "--no-ff", session_id, "-m", f"merge session {session_id}"],
+    ]:
+        result = _git_ok(step)
+        if "error" in result:
+            return result
+
+    if delete_branch:
+        _git(["branch", "-d", session_id])
+
+    return {"ok": True, "merged": session_id}
+
+
+@mcp.tool()
+def rollback_experiment(experiment_id: str, paper_id: str = None, project_id: str = None) -> dict:
+    """
+    Restore a specific experiment directory to its last committed state.
+    Discards any uncommitted changes to that experiment only — nothing else is touched.
+
+    Useful when an agent has partially written docs and you want to start over
+    without losing the rest of the store.
+    """
+    code, _, _ = _git(["rev-parse", "--git-dir"])
+    if code != 0:
+        return {"error": "Not a git repository."}
+
+    if paper_id:
+        rel_path = f"papers/{paper_id}/experiments/{experiment_id}"
+    elif project_id:
+        rel_path = f"projects/{project_id}/experiments/{experiment_id}"
+    else:
+        return {"error": "Provide either paper_id or project_id."}
+
+    result = _git_ok(["checkout", "HEAD", "--", rel_path])
+    if "error" in result:
+        return result
+    return {"ok": True, "restored": rel_path}
+
+
+@mcp.tool()
+def diff_experiment(experiment_id: str, paper_id: str = None, project_id: str = None) -> dict:
+    """
+    Show uncommitted changes to a specific experiment directory.
+    Useful during review — see exactly what changed since last commit.
+    """
+    code, _, _ = _git(["rev-parse", "--git-dir"])
+    if code != 0:
+        return {"error": "Not a git repository."}
+
+    if paper_id:
+        rel_path = f"papers/{paper_id}/experiments/{experiment_id}"
+    elif project_id:
+        rel_path = f"projects/{project_id}/experiments/{experiment_id}"
+    else:
+        return {"error": "Provide either paper_id or project_id."}
+
+    _, diff, _ = _git(["diff", "HEAD", "--", rel_path])
+    _, stat, _ = _git(["diff", "HEAD", "--stat", "--", rel_path])
+    return {"path": rel_path, "stat": stat, "diff": diff or "No uncommitted changes."}
+
+
+@mcp.tool()
+def git_log(n: int = 20, experiment_id: str = None, paper_id: str = None, project_id: str = None) -> list[dict]:
+    """
+    Show recent commits, optionally scoped to a specific experiment directory.
+    Gives a chronological record of all agent activity on a piece of work.
+    """
+    code, _, _ = _git(["rev-parse", "--git-dir"])
+    if code != 0:
+        return [{"error": "Not a git repository."}]
+
+    args = ["log", f"-{n}", "--pretty=format:%H|%h|%ai|%s"]
+    if experiment_id:
+        if paper_id:
+            args += ["--", f"papers/{paper_id}/experiments/{experiment_id}"]
+        elif project_id:
+            args += ["--", f"projects/{project_id}/experiments/{experiment_id}"]
+
+    _, out, _ = _git(args)
+    if not out:
+        return []
+    entries = []
+    for line in out.splitlines():
+        parts = line.split("|", 3)
+        if len(parts) == 4:
+            entries.append({"sha": parts[1], "full_sha": parts[0],
+                             "timestamp": parts[2], "message": parts[3]})
+    return entries
 
 
 # ──────────────────────────────────────────────────────────────
