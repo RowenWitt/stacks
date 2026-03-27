@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Research Tracker MCP Server
-Empirical research management: paper discovery, experiment tracking,
-synthesis lineage, peer review, and graph visualization.
+Stacks — empirical research tracker MCP server.
+Paper/project store, experiment lineage, synthesis, peer review,
+git versioning, and a live browser UI at http://localhost:PORT/ui
 """
 
 import json
@@ -10,9 +10,12 @@ import os
 import re
 import uuid
 import argparse
+import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional, Literal
+from urllib.parse import urlparse, parse_qs
 
 import arxiv
 from fastmcp import FastMCP
@@ -58,7 +61,7 @@ def reviewers_path() -> Path:
 
 
 def ensure_dirs():
-    for d in [papers_dir(), synthesis_dir(), ideas_dir(), sessions_dir(), projects_dir()]:
+    for d in [papers_dir(), synthesis_dir(), ideas_dir(), sessions_dir(), projects_dir(), queue_dir(), rfs_dir()]:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -70,7 +73,7 @@ def load_index() -> dict:
     p = index_path()
     if p.exists():
         return json.loads(p.read_text())
-    return {"papers": {}, "synthesis": {}, "ideas": {}, "sessions": {}, "projects": {}}
+    return {"papers": {}, "synthesis": {}, "ideas": {}, "sessions": {}, "projects": {}, "queue": {}, "rfs": {}}
 
 
 def save_index(idx: dict):
@@ -389,6 +392,107 @@ def annotate_paper(arxiv_id: str, annotation: str) -> dict:
         return {"error": f"Paper {arxiv_id} not stored locally. Run download_paper first."}
     p.write_text(p.read_text() + f"\n---\n*{now_iso()}*\n\n{annotation}\n")
     return {"status": "ok"}
+
+
+
+@mcp.tool()
+def add_local_source(
+    source_id: str,
+    title: str,
+    source_type: Literal["pdf", "url", "text", "blog", "other"],
+    authors: list[str] = None,
+    content: str = None,
+    path: str = None,
+    url: str = None,
+    notes: str = None,
+    fetch_url: bool = False,
+) -> dict:
+    """
+    Add a non-arXiv source as a first-class paper node.
+    Experiments can be rooted on it via checkout(arxiv_id=source_id, ...).
+
+    source_id: filesystem-safe slug, e.g. 'karpathy-makemore-blog'
+    source_type: pdf | url | text | blog | other
+    content: paste text directly (stored as paper.md body)
+    path: local file path for reference (recorded, not read)
+    url: web URL for reference
+    fetch_url: if True and url provided, fetches and strips HTML to text
+    notes: immediate annotation
+    """
+    ensure_dirs()
+    if not re.match(r'^[a-zA-Z0-9_-]+$', source_id):
+        return {"error": "source_id must contain only letters, numbers, hyphens, and underscores."}
+
+    idx = load_index()
+    if source_id in idx.get("papers", {}):
+        return {"error": "Source '{}' already exists. Use annotate_paper to add notes.".format(source_id)}
+
+    paper_path = papers_dir() / source_id
+    paper_path.mkdir(parents=True, exist_ok=True)
+    (paper_path / "experiments").mkdir(exist_ok=True)
+
+    fetched_content = None
+    if fetch_url and url:
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            import re as _re
+            fetched_content = _re.sub(r'<[^>]+>', ' ', raw)
+            fetched_content = _re.sub(r'[ \t]{2,}', ' ', fetched_content).strip()
+        except Exception as e:
+            fetched_content = "[fetch failed: {}]".format(e)
+
+    body = content or fetched_content or ""
+    lines = ["# " + title, ""]
+    if authors:
+        lines.append("**Authors**: " + ", ".join(authors) + "  ")
+    if url:
+        lines.append("**URL**: " + url + "  ")
+    if path:
+        lines.append("**Local path**: " + path + "  ")
+    lines.append("**Type**: " + source_type + "  ")
+    lines.append("**Added**: " + now_iso() + "  ")
+    if body:
+        lines += ["", "## Content", "", body]
+    paper_md = "\n".join(lines) + "\n"
+
+    (paper_path / "paper.md").write_text(paper_md)
+    ann = "# Annotations: " + title + "\n\n"
+    if notes:
+        ann += "*" + now_iso() + "*\n\n" + notes + "\n"
+    (paper_path / "annotations.md").write_text(ann)
+
+    metadata = {
+        "source_id": source_id,
+        "title": title,
+        "authors": authors or [],
+        "source_type": source_type,
+        "url": url,
+        "path": path,
+        "added_at": now_iso(),
+        "derived_from": [],
+    }
+    (paper_path / "metadata.json").write_text(json.dumps(metadata, indent=2))
+
+    idx["papers"][source_id] = {
+        "title": title,
+        "authors": authors or [],
+        "categories": [source_type],
+        "published": now_iso()[:10],
+        "downloaded_at": now_iso(),
+        "experiments": [],
+        "concepts": [],
+    }
+    save_index(idx)
+
+    return {
+        "status": "added",
+        "source_id": source_id,
+        "path": str(paper_path),
+        "note": "Use checkout(arxiv_id='{}', ...) to start experiments.".format(source_id),
+    }
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1635,6 +1739,48 @@ def get_graph(root_id: str = None, max_depth: int = None) -> dict:
         for parent in manifest.get("derived_from", []):
             edges.append({"source": parent, "target": sid, "type": "derived_from"})
 
+    for project_id, project_data in idx.get("projects", {}).items():
+        if root_id and project_id != root_id:
+            continue
+        if project_id not in seen:
+            seen.add(project_id)
+            nodes.append({
+                "id": project_id,
+                "type": "project",
+                "label": project_data.get("name", project_id)[:60],
+                "generation": 0,
+                "status": "root",
+                "concepts": project_data.get("concepts", []),
+                "confidence": 1.0,
+            })
+            for parent in project_data.get("seeded_from", []):
+                edges.append({"source": parent, "target": project_id, "type": "derived_from"})
+        for exp in project_data.get("experiments", []):
+            eid = exp["id"]
+            if eid in seen:
+                continue
+            gen = compute_generation(eid, idx)
+            if max_depth is not None and gen > max_depth:
+                continue
+            seen.add(eid)
+            mp = projects_dir() / project_id / "experiments" / eid / "manifest.json"
+            manifest = json.loads(mp.read_text()) if mp.exists() else {}
+            nodes.append({
+                "id": eid,
+                "type": "experiment",
+                "label": exp.get("name", eid)[:60],
+                "project_id": project_id,
+                "generation": gen,
+                "status": exp.get("status"),
+                "outcome_direction": exp.get("outcome_direction"),
+                "concepts": exp.get("concepts", []),
+                "confidence": compute_confidence(eid, project_id=project_id),
+                "surprising": manifest.get("surprising", False),
+            })
+            edges.append({"source": project_id, "target": eid, "type": "contains"})
+            for parent in manifest.get("derived_from", []):
+                edges.append({"source": parent, "target": eid, "type": "derived_from"})
+
     for idea_id, idea_data in idx.get("ideas", {}).items():
         if idea_data.get("status") == "unresearched":
             nodes.append({
@@ -2017,28 +2163,650 @@ def git_log(n: int = 20, experiment_id: str = None, paper_id: str = None, projec
     return entries
 
 
+
+
 # ──────────────────────────────────────────────────────────────
-# Entry point
+# TOOLS: Experiment queue
 # ──────────────────────────────────────────────────────────────
+
+def queue_dir() -> Path:
+    return storage() / "queue"
+
+def rfs_dir() -> Path:
+    return storage() / "rfs"
+
+def rate_limits_path() -> Path:
+    return storage() / "rate_limits.json"
+
+
+def load_rate_limits() -> dict:
+    p = rate_limits_path()
+    return json.loads(p.read_text()) if p.exists() else {}
+
+def save_rate_limits(rl: dict):
+    rate_limits_path().write_text(json.dumps(rl, indent=2))
+
+
+@mcp.tool()
+def queue_experiment(
+    name: str,
+    hypothesis: str,
+    root_id: str,
+    root_type: Literal["paper", "project"],
+    suggested_approach: str = None,
+    rationale: str = None,
+    concepts: list[str] = None,
+    derived_from: list[str] = None,
+    priority: Literal["low", "normal", "high"] = "normal",
+    added_by: str = None,
+) -> dict:
+    """
+    Add an experiment to the shared queue for a project or paper.
+    Any agent can claim and run queued experiments.
+
+    name: short descriptive name
+    hypothesis: what you expect to find and why
+    root_id: paper arxiv_id or project_id this experiment belongs to
+    root_type: paper | project
+    suggested_approach: optional implementation notes
+    rationale: why this is worth running now
+    concepts: searchable tags
+    derived_from: experiment IDs this builds on
+    priority: low | normal | high
+    added_by: agent or human who queued it
+    """
+    ensure_dirs()
+    queue_dir().mkdir(exist_ok=True)
+
+    item_id = "q-{}-{}".format(ts(), slugify(name))
+    item = {
+        "id": item_id,
+        "name": name,
+        "hypothesis": hypothesis,
+        "root_id": root_id,
+        "root_type": root_type,
+        "suggested_approach": suggested_approach or "",
+        "rationale": rationale or "",
+        "concepts": concepts or [],
+        "derived_from": derived_from or [],
+        "priority": priority,
+        "added_by": added_by,
+        "status": "available",
+        "claimed_by": None,
+        "claimed_at": None,
+        "experiment_id": None,
+        "created_at": now_iso(),
+    }
+    (queue_dir() / "{}.json".format(item_id)).write_text(json.dumps(item, indent=2))
+
+    idx = load_index()
+    idx.setdefault("queue", {})[item_id] = {
+        "name": name, "root_id": root_id, "root_type": root_type,
+        "priority": priority, "status": "available", "concepts": concepts or [],
+    }
+    save_index(idx)
+    return {"queue_id": item_id, "status": "queued"}
+
+
+@mcp.tool()
+def claim_queued_experiment(queue_id: str, agent_id: str) -> dict:
+    """
+    Atomically claim a queued experiment. Prevents two agents picking up the same work.
+    Returns the full queue item including hypothesis and suggested approach.
+    After claiming, run the experiment normally via checkout() then checkin().
+    Call complete_queued_experiment() when done to link the results.
+    """
+    p = queue_dir() / "{}.json".format(queue_id)
+    if not p.exists():
+        return {"error": "Queue item not found"}
+    item = json.loads(p.read_text())
+    if item["status"] != "available":
+        return {"error": "Already claimed by {}".format(item.get("claimed_by", "unknown"))}
+
+    item["status"] = "claimed"
+    item["claimed_by"] = agent_id
+    item["claimed_at"] = now_iso()
+    p.write_text(json.dumps(item, indent=2))
+
+    idx = load_index()
+    if queue_id in idx.get("queue", {}):
+        idx["queue"][queue_id]["status"] = "claimed"
+    save_index(idx)
+
+    return {
+        "queue_id": queue_id,
+        "status": "claimed",
+        "name": item["name"],
+        "root_id": item["root_id"],
+        "root_type": item["root_type"],
+        "hypothesis": item["hypothesis"],
+        "suggested_approach": item["suggested_approach"],
+        "rationale": item["rationale"],
+        "concepts": item["concepts"],
+        "derived_from": item["derived_from"],
+        "next_step": "Run checkout(arxiv_id='{}', ...) then call complete_queued_experiment() when done.".format(item["root_id"]),
+    }
+
+
+@mcp.tool()
+def complete_queued_experiment(queue_id: str, experiment_id: str) -> dict:
+    """Link a completed experiment back to its queue item and mark it done."""
+    p = queue_dir() / "{}.json".format(queue_id)
+    if not p.exists():
+        return {"error": "Queue item not found"}
+    item = json.loads(p.read_text())
+    item["status"] = "complete"
+    item["experiment_id"] = experiment_id
+    item["completed_at"] = now_iso()
+    p.write_text(json.dumps(item, indent=2))
+
+    idx = load_index()
+    if queue_id in idx.get("queue", {}):
+        idx["queue"][queue_id].update({"status": "complete", "experiment_id": experiment_id})
+    save_index(idx)
+    return {"status": "complete", "queue_id": queue_id, "experiment_id": experiment_id}
+
+
+@mcp.tool()
+def abandon_queued_experiment(queue_id: str, agent_id: str, reason: str = None) -> dict:
+    """Release a claimed queue item back to available so another agent can pick it up."""
+    p = queue_dir() / "{}.json".format(queue_id)
+    if not p.exists():
+        return {"error": "Queue item not found"}
+    item = json.loads(p.read_text())
+    if item.get("claimed_by") != agent_id:
+        return {"error": "Not claimed by {}".format(agent_id)}
+    item["status"] = "available"
+    item["claimed_by"] = None
+    item["claimed_at"] = None
+    if reason:
+        item.setdefault("notes", []).append({"abandoned_by": agent_id, "reason": reason, "at": now_iso()})
+    p.write_text(json.dumps(item, indent=2))
+
+    idx = load_index()
+    if queue_id in idx.get("queue", {}):
+        idx["queue"][queue_id]["status"] = "available"
+    save_index(idx)
+    return {"status": "available", "queue_id": queue_id}
+
+
+@mcp.tool()
+def list_queue(
+    root_id: str = None,
+    status: Literal["available", "claimed", "complete", "all"] = "available",
+    priority: str = None,
+) -> list[dict]:
+    """
+    List queued experiments. Defaults to available items only.
+    Filter by root_id (project or paper) and/or priority.
+    """
+    ensure_dirs()
+    queue_dir().mkdir(exist_ok=True)
+    items = [json.loads(f.read_text()) for f in queue_dir().glob("*.json")]
+    if status != "all":
+        items = [i for i in items if i.get("status") == status]
+    if root_id:
+        items = [i for i in items if i.get("root_id") == root_id]
+    if priority:
+        items = [i for i in items if i.get("priority") == priority]
+    priority_order = {"high": 0, "normal": 1, "low": 2}
+    items.sort(key=lambda x: (priority_order.get(x.get("priority", "normal"), 1), x.get("created_at", "")))
+    return [{
+        "id": i["id"], "name": i["name"], "root_id": i["root_id"],
+        "root_type": i["root_type"], "priority": i["priority"],
+        "status": i["status"], "claimed_by": i.get("claimed_by"),
+        "concepts": i.get("concepts", []),
+        "hypothesis_preview": i["hypothesis"][:120],
+        "created_at": i["created_at"],
+    } for i in items]
+
+
+# ──────────────────────────────────────────────────────────────
+# TOOLS: Request for solution
+# ──────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def create_rfs(
+    title: str,
+    project_id: str,
+    problem_statement: str,
+    current_approach: str,
+    blockers: str,
+    already_tried: str = None,
+    constraints: str = None,
+    success_criteria: str = None,
+    related_experiments: list[str] = None,
+    created_by: str = None,
+) -> dict:
+    """
+    Create a Request for Solution — a detailed brief for a research agent.
+    Describes a specific problem, what has been tried, and what success looks like.
+    Research agents pick these up, do targeted literature search and experimentation,
+    and post back structured findings.
+
+    problem_statement: clear description of what is broken or unknown
+    current_approach: how the problem is currently being handled
+    blockers: what specifically is going wrong or limiting progress
+    already_tried: comma-separated or prose list of approaches already attempted
+    constraints: hard constraints the solution must respect
+    success_criteria: what a good solution looks like concretely
+    related_experiments: experiment IDs with relevant context
+    """
+    ensure_dirs()
+    rfs_dir().mkdir(exist_ok=True)
+
+    rfs_id = "rfs-{}-{}".format(ts(), slugify(title))
+    rfs = {
+        "id": rfs_id,
+        "title": title,
+        "project_id": project_id,
+        "problem_statement": problem_statement,
+        "current_approach": current_approach,
+        "blockers": blockers,
+        "already_tried": already_tried or "",
+        "constraints": constraints or "",
+        "success_criteria": success_criteria or "",
+        "related_experiments": related_experiments or [],
+        "created_by": created_by,
+        "status": "open",
+        "claimed_by": None,
+        "claimed_at": None,
+        "solutions": [],
+        "created_at": now_iso(),
+    }
+    (rfs_dir() / "{}.json".format(rfs_id)).write_text(json.dumps(rfs, indent=2))
+
+    idx = load_index()
+    idx.setdefault("rfs", {})[rfs_id] = {
+        "title": title, "project_id": project_id,
+        "status": "open", "created_at": rfs["created_at"],
+    }
+    save_index(idx)
+    return {"rfs_id": rfs_id, "status": "open"}
+
+
+@mcp.tool()
+def list_rfs(project_id: str = None, status: str = "open") -> list[dict]:
+    """List requests for solution, optionally filtered by project and status."""
+    ensure_dirs()
+    rfs_dir().mkdir(exist_ok=True)
+    items = [json.loads(f.read_text()) for f in rfs_dir().glob("*.json")]
+    if project_id:
+        items = [i for i in items if i.get("project_id") == project_id]
+    if status and status != "all":
+        items = [i for i in items if i.get("status") == status]
+    return [{
+        "id": i["id"], "title": i["title"], "project_id": i["project_id"],
+        "status": i["status"], "claimed_by": i.get("claimed_by"),
+        "solution_count": len(i.get("solutions", [])),
+        "problem_preview": i["problem_statement"][:120],
+        "created_at": i["created_at"],
+    } for i in sorted(items, key=lambda x: x.get("created_at", ""), reverse=True)]
+
+
+@mcp.tool()
+def get_rfs(rfs_id: str) -> dict:
+    """Get the full detail of a request for solution including all solutions posted."""
+    p = rfs_dir() / "{}.json".format(rfs_id)
+    if not p.exists():
+        return {"error": "RFS not found"}
+    return json.loads(p.read_text())
+
+
+@mcp.tool()
+def claim_rfs(rfs_id: str, agent_id: str) -> dict:
+    """Claim a request for solution to work on it. Returns the full brief."""
+    p = rfs_dir() / "{}.json".format(rfs_id)
+    if not p.exists():
+        return {"error": "RFS not found"}
+    rfs = json.loads(p.read_text())
+    if rfs["status"] != "open":
+        return {"error": "RFS is {} — not available".format(rfs["status"])}
+    rfs["status"] = "claimed"
+    rfs["claimed_by"] = agent_id
+    rfs["claimed_at"] = now_iso()
+    p.write_text(json.dumps(rfs, indent=2))
+
+    idx = load_index()
+    if rfs_id in idx.get("rfs", {}):
+        idx["rfs"][rfs_id]["status"] = "claimed"
+    save_index(idx)
+    return rfs
+
+
+@mcp.tool()
+def post_solution(
+    rfs_id: str,
+    agent_id: str,
+    summary: str,
+    approach: str,
+    findings: str,
+    recommended_experiments: list[str] = None,
+    related_papers: list[str] = None,
+    confidence: Literal["low", "medium", "high"] = "medium",
+    resolves: bool = False,
+) -> dict:
+    """
+    Post findings back to a request for solution.
+
+    summary: one paragraph — what you found
+    approach: how you researched this (papers read, experiments run, etc.)
+    findings: detailed findings — can be long, use markdown
+    recommended_experiments: queue_ids or descriptions of follow-on experiments to run
+    related_papers: arxiv IDs or source_ids relevant to the solution
+    confidence: how confident you are this addresses the problem
+    resolves: True if this fully resolves the RFS, False if partial or directional
+    """
+    p = rfs_dir() / "{}.json".format(rfs_id)
+    if not p.exists():
+        return {"error": "RFS not found"}
+    rfs = json.loads(p.read_text())
+
+    solution = {
+        "id": "sol-{}".format(ts()),
+        "agent_id": agent_id,
+        "summary": summary,
+        "approach": approach,
+        "findings": findings,
+        "recommended_experiments": recommended_experiments or [],
+        "related_papers": related_papers or [],
+        "confidence": confidence,
+        "resolves": resolves,
+        "posted_at": now_iso(),
+    }
+    rfs["solutions"].append(solution)
+    if resolves:
+        rfs["status"] = "resolved"
+    elif rfs["status"] == "claimed":
+        rfs["status"] = "open"
+        rfs["claimed_by"] = None
+    p.write_text(json.dumps(rfs, indent=2))
+
+    idx = load_index()
+    if rfs_id in idx.get("rfs", {}):
+        idx["rfs"][rfs_id]["status"] = rfs["status"]
+    save_index(idx)
+    return {"status": rfs["status"], "solution_id": solution["id"]}
+
+
+# ──────────────────────────────────────────────────────────────
+# TOOLS: Rate limit tracking
+# ──────────────────────────────────────────────────────────────
+
+# Default cooldown windows in seconds per service
+DEFAULT_COOLDOWNS = {
+    "arxiv": 60,
+    "anthropic": 60,
+    "openai": 60,
+    "huggingface": 30,
+    "github": 60,
+}
+
+@mcp.tool()
+def record_rate_limit_hit(
+    service: str,
+    retry_after_seconds: int = None,
+    context: str = None,
+) -> dict:
+    """
+    Record that a rate limit was hit for a service.
+    Call this immediately when you get a 429 or rate limit error.
+    Other agents will check this before making requests to the same service.
+
+    service: e.g. "arxiv", "anthropic", "openai", "huggingface", "github"
+    retry_after_seconds: use the Retry-After header value if available
+    context: optional note on what triggered it
+    """
+    ensure_dirs()
+    rl = load_rate_limits()
+    cooldown = retry_after_seconds or DEFAULT_COOLDOWNS.get(service, 60)
+    rl[service] = {
+        "last_hit": now_iso(),
+        "last_hit_ts": datetime.now(timezone.utc).timestamp(),
+        "cooldown_seconds": cooldown,
+        "context": context or "",
+        "hit_count": rl.get(service, {}).get("hit_count", 0) + 1,
+    }
+    save_rate_limits(rl)
+    return {
+        "service": service,
+        "recorded": True,
+        "suggested_wait_seconds": cooldown,
+        "resume_after": datetime.fromtimestamp(
+            rl[service]["last_hit_ts"] + cooldown, tz=timezone.utc
+        ).isoformat(),
+    }
+
+
+@mcp.tool()
+def check_rate_limit(service: str) -> dict:
+    """
+    Check whether it is safe to call a service.
+    Returns wait_seconds=0 if clear, or the estimated seconds remaining if still cooling down.
+    Always call this before making external API requests if you have recently seen rate limit errors.
+    """
+    ensure_dirs()
+    rl = load_rate_limits()
+    if service not in rl:
+        return {"service": service, "status": "clear", "wait_seconds": 0}
+
+    entry = rl[service]
+    elapsed = datetime.now(timezone.utc).timestamp() - entry["last_hit_ts"]
+    remaining = max(0.0, entry["cooldown_seconds"] - elapsed)
+
+    if remaining > 0:
+        return {
+            "service": service,
+            "status": "cooling",
+            "wait_seconds": round(remaining, 1),
+            "resume_after": datetime.fromtimestamp(
+                entry["last_hit_ts"] + entry["cooldown_seconds"], tz=timezone.utc
+            ).isoformat(),
+            "hit_count": entry.get("hit_count", 1),
+            "context": entry.get("context", ""),
+        }
+    return {
+        "service": service,
+        "status": "clear",
+        "wait_seconds": 0,
+        "last_hit": entry.get("last_hit"),
+        "hit_count": entry.get("hit_count", 1),
+    }
+
+
+@mcp.tool()
+def list_rate_limit_status() -> list[dict]:
+    """Show current rate limit status for all tracked services."""
+    ensure_dirs()
+    rl = load_rate_limits()
+    now_ts = datetime.now(timezone.utc).timestamp()
+    results = []
+    for service, entry in rl.items():
+        elapsed = now_ts - entry["last_hit_ts"]
+        remaining = max(0.0, entry["cooldown_seconds"] - elapsed)
+        results.append({
+            "service": service,
+            "status": "cooling" if remaining > 0 else "clear",
+            "wait_seconds": round(remaining, 1),
+            "hit_count": entry.get("hit_count", 1),
+            "last_hit": entry.get("last_hit"),
+        })
+    return sorted(results, key=lambda x: x["wait_seconds"], reverse=True)
+
+
+
+# ──────────────────────────────────────────────────────────────
+# UI server — live browser interface at /ui
+# ──────────────────────────────────────────────────────────────
+
+def _build_content_map() -> dict:
+    idx = load_index()
+    content = {}
+    for paper_id, paper_data in idx.get("papers", {}).items():
+        p = papers_dir() / paper_id
+        abstract, ann = "", ""
+        if (p / "metadata.json").exists():
+            abstract = json.loads((p / "metadata.json").read_text()).get("abstract", "")
+        if (p / "annotations.md").exists():
+            ann = (p / "annotations.md").read_text()
+        content[paper_id] = {
+            "type": "paper", "title": paper_data.get("title", paper_id),
+            "abstract": abstract, "annotations": ann,
+            "authors": paper_data.get("authors", []),
+            "published": paper_data.get("published", ""),
+            "categories": paper_data.get("categories", []),
+        }
+        for exp in paper_data.get("experiments", []):
+            ep = p / "experiments" / exp["id"]
+            content[exp["id"]] = _read_exp_content(ep, exp, "paper", paper_id)
+
+    for project_id, project_data in idx.get("projects", {}).items():
+        pp = projects_dir() / project_id
+        notes = (pp / "notes.md").read_text() if (pp / "notes.md").exists() else ""
+        content[project_id] = {
+            "type": "project", "title": project_data.get("name", project_id),
+            "description": project_data.get("description", ""),
+            "notes": notes, "seeded_from": project_data.get("seeded_from", []),
+        }
+        for exp in project_data.get("experiments", []):
+            ep = pp / "experiments" / exp["id"]
+            content[exp["id"]] = _read_exp_content(ep, exp, "project", project_id)
+
+    for synth_id, synth_data in idx.get("synthesis", {}).items():
+        sp = synthesis_dir() / synth_id
+        content[synth_id] = _read_exp_content(sp, synth_data, "synthesis", synth_id)
+
+    return content
+
+
+def _read_exp_content(exp_path: Path, exp_data: dict, root_type: str, root_id: str) -> dict:
+    def read(fname):
+        p = exp_path / fname
+        return p.read_text() if p.exists() else ""
+
+    manifest, status = {}, {}
+    if (exp_path / "manifest.json").exists():
+        manifest = json.loads((exp_path / "manifest.json").read_text())
+    if (exp_path / "status.json").exists():
+        status = json.loads((exp_path / "status.json").read_text())
+
+    reviews = []
+    rd = exp_path / "reviews"
+    if rd.exists():
+        for rf in rd.glob("*.json"):
+            r = json.loads(rf.read_text())
+            reviews.append({"reviewer": r.get("reviewer_agent"), "type": r.get("review_type"),
+                            "verdict": r.get("verdict"), "critique": r.get("critique", "")})
+    return {
+        "type": root_type if root_type == "synthesis" else "experiment",
+        "root_type": root_type, "root_id": root_id,
+        "name": exp_data.get("name", ""),
+        "one_line": exp_data.get("one_line") or manifest.get("one_line", ""),
+        "concepts": exp_data.get("concepts", []),
+        "hyperparameter_axes": manifest.get("hyperparameter_axes", []),
+        "derived_from": manifest.get("derived_from", []),
+        "outcome_direction": exp_data.get("outcome_direction") or status.get("outcome_direction"),
+        "status": status.get("status"), "checked_out_by": status.get("checked_out_by"),
+        "intent": status.get("intent"), "surprising": manifest.get("surprising", False),
+        "hypothesis": read("hypothesis.md"), "implementation": read("implementation.md"),
+        "data": read("data.md"), "outcomes_raw": read("outcomes/raw.md"),
+        "outcomes_learnings": read("outcomes/learnings.md"),
+        "outcomes_paper": read("outcomes/paper.md"),
+        "reviews": reviews,
+    }
+
+
+def _build_queue_data() -> dict:
+    """Build queue + RFS data for the UI, grouped by root."""
+    ensure_dirs()
+    queue_dir().mkdir(exist_ok=True)
+    rfs_dir().mkdir(exist_ok=True)
+    idx = load_index()
+    queue_items = []
+    for f in queue_dir().glob("*.json"):
+        try: queue_items.append(json.loads(f.read_text()))
+        except Exception: pass
+    rfs_items = []
+    for f in rfs_dir().glob("*.json"):
+        try: rfs_items.append(json.loads(f.read_text()))
+        except Exception: pass
+    root_labels = {}
+    for pid, p in idx.get("papers", {}).items():
+        root_labels[pid] = p.get("title", pid)
+    for pid, p in idx.get("projects", {}).items():
+        root_labels[pid] = p.get("name", pid)
+    return {"queue": queue_items, "rfs": rfs_items, "root_labels": root_labels}
+
+
+def _serve_ui(ui_port: int, ui_host: str):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args): pass
+
+        def do_GET(self):
+            path = urlparse(self.path).path.rstrip("/") or "/"
+            if path in ("/", "/ui"):
+                self._serve_page()
+            elif path == "/api/graph":
+                self._serve_json(get_graph())
+            elif path == "/api/content":
+                self._serve_json(_build_content_map())
+            elif path == "/api/queue":
+                self._serve_json(_build_queue_data())
+            else:
+                self.send_response(404); self.end_headers()
+
+        def _serve_json(self, data):
+            body = json.dumps(data).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(body))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers(); self.wfile.write(body)
+
+        def _serve_page(self):
+            ui_file = Path(__file__).parent / 'ui.html'
+            if not ui_file.exists():
+                self.send_response(404); self.end_headers(); return
+            body = ui_file.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers(); self.wfile.write(body)
+
+    try:
+        server = HTTPServer((ui_host, ui_port), Handler)
+    except OSError:
+        return
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    print(f"[stacks] UI at http://{ui_host}:{ui_port}/ui")
+
+
 
 def main():
     global STORAGE
-    parser = argparse.ArgumentParser(description="Research Tracker MCP Server")
+    parser = argparse.ArgumentParser(description="Stacks research tracker MCP server")
     parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio",
                         help="stdio: each agent spawns its own process (default). "
                              "sse: persistent server, all agents connect over HTTP.")
     parser.add_argument("--port", type=int, default=8050)
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--ui-port", type=int, default=8051,
+                        help="Port for the browser UI. Set to 0 to disable.")
     parser.add_argument("--storage-path", default=str(Path.home() / "research"),
-                        help="Path to research data directory (shared across all agent sessions)")
+                        help="Path to research data directory.")
     args = parser.parse_args()
 
     STORAGE = Path(args.storage_path).expanduser()
     ensure_dirs()
 
+    if args.ui_port:
+        _serve_ui(args.ui_port, args.host)
+
     if args.transport == "sse":
-        print(f"[research-tracker] SSE server on {args.host}:{args.port}")
-        print(f"[research-tracker] Storage: {STORAGE}")
+        print(f"[stacks] MCP (SSE) on {args.host}:{args.port}")
+        print(f"[stacks] Storage: {STORAGE}")
         mcp.run(transport="sse", host=args.host, port=args.port)
     else:
         mcp.run(transport="stdio")

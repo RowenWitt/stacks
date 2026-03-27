@@ -1,3 +1,4 @@
+
 # Stacks
 
 The memory and accountability layer for agentic research loops.
